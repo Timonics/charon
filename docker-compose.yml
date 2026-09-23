@@ -1,0 +1,27 @@
+name: charon
+
+# Local development database ONLY. Production connects to a managed Postgres
+# via DATABASE_URL injected from the environment — never commit real
+# credentials; see .env.example and non-negotiable #10.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: charon
+    ports:
+      # 5433 (not 5432): the host already runs a local PostgreSQL on 5432;
+      # mapping to a distinct port avoids silently connecting to the wrong
+      # server depending on which process wins the bind race.
+      - '5433:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
