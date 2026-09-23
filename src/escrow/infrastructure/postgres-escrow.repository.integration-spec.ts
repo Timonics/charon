@@ -8,6 +8,7 @@ import { PostgresEscrowRepository } from './postgres-escrow.repository';
 import { PostgresIdempotencyStore } from '../../payments/infrastructure/postgres-idempotency.store';
 import { LedgerAppender } from '../../ledger/application/ledger-appender';
 import { PostgresLedgerRepository } from '../../ledger/infrastructure/postgres-ledger.repository';
+import { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
 import {
   applyMigrations,
   closeIntegrationPool,
@@ -60,20 +61,24 @@ describe('PostgresEscrowRepository (integration)', () => {
         isSettled: () => Promise.resolve(true),
       };
       const appender = new LedgerAppender(new PostgresLedgerRepository(pool));
+      const unitOfWork = new UnitOfWork(pool);
       const place = new PlaceEscrowHoldUseCase({
         idempotency: new PostgresIdempotencyStore(pool),
         escrows: repo(),
         ledger: appender,
         settledPayments: settled,
+        unitOfWork,
       });
       const confirm = new ConfirmEscrowHoldUseCase({
         escrows: repo(),
         ledger: appender,
+        unitOfWork,
       });
       const release = new ReleaseEscrowUseCase({
         idempotency: new PostgresIdempotencyStore(pool),
         escrows: repo(),
         ledger: appender,
+        unitOfWork,
       });
 
       const placed = await place.execute({

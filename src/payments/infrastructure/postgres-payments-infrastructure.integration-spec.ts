@@ -4,6 +4,7 @@ import { InitiatePaymentUseCase } from '../application/initiate-payment.use-case
 import { PaymentIntent } from '../domain/payment-intent';
 import { LedgerAppender } from '../../ledger/application/ledger-appender';
 import { PostgresLedgerRepository } from '../../ledger/infrastructure/postgres-ledger.repository';
+import { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
 import { PostgresIdempotencyStore } from './postgres-idempotency.store';
 import { PostgresPaymentIntentRepository } from './postgres-payment-intent.repository';
 import { PostgresProcessedWebhookStore } from './postgres-processed-webhook.store';
@@ -121,6 +122,7 @@ describe('Postgres payments infrastructure (integration)', () => {
         idempotency: new PostgresIdempotencyStore(pool),
         intents: new PostgresPaymentIntentRepository(pool),
         ledger: new LedgerAppender(new PostgresLedgerRepository(pool)),
+        unitOfWork: new UnitOfWork(pool),
       });
 
       const command = {
