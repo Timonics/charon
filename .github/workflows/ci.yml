@@ -42,7 +42,14 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci --no-audit --no-fund
+        # --no-optional: skip platform-specific optional deps (e.g.
+        # @unrs/resolver-binding-linux-x64-gnu) that the npm Windows
+        # resolver doesn't materialize, but CI's npm on Linux tries to
+        # install and then complains about missing transitive @emnapi/*
+        # entries (EUSAGE). None of @nestjs/cli's runtime code imports
+        # those bindings — they're for terminal rendering in the CLI —
+        # so dropping them is safe for lint/build/test.
+        run: npm ci --no-audit --no-fund --no-optional
 
       - name: Lint
         run: npm run lint
@@ -98,7 +105,14 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci --no-audit --no-fund
+        # --no-optional: skip platform-specific optional deps (e.g.
+        # @unrs/resolver-binding-linux-x64-gnu) that the npm Windows
+        # resolver doesn't materialize, but CI's npm on Linux tries to
+        # install and then complains about missing transitive @emnapi/*
+        # entries (EUSAGE). None of @nestjs/cli's runtime code imports
+        # those bindings — they're for terminal rendering in the CLI —
+        # so dropping them is safe for lint/build/test.
+        run: npm ci --no-audit --no-fund --no-optional
 
       - name: Install Postgres client tools
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
