@@ -39,26 +39,24 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: npm
+          cache: yarn
 
       - name: Install dependencies
-        # --no-optional: skip platform-specific optional deps (e.g.
-        # @unrs/resolver-binding-linux-x64-gnu) that the npm Windows
-        # resolver doesn't materialize, but CI's npm on Linux tries to
-        # install and then complains about missing transitive @emnapi/*
-        # entries (EUSAGE). None of @nestjs/cli's runtime code imports
-        # those bindings — they're for terminal rendering in the CLI —
-        # so dropping them is safe for lint/build/test.
-        run: npm ci --no-audit --no-fund --no-optional
+        # Yarn 1 (Classic). --frozen-lockfile ensures CI fails loud if
+        # yarn.lock is out of sync with package.json (the equivalent of
+        # npm ci's contract). yarn.lock is platform-stable across
+        # dev-machine OSes, so the npm-lockfile-drift failure mode that
+        # hit the first CI attempt cannot recur here.
+        run: yarn install --frozen-lockfile --non-interactive --network-timeout 600000
 
       - name: Lint
-        run: npm run lint
+        run: yarn lint
 
       - name: Build (TypeScript via nest build)
-        run: npm run build
+        run: yarn build
 
       - name: Unit tests
-        run: npm test -- --ci
+        run: yarn test --ci
 
   # ---------------------------------------------------------------
   # Job 2 — Integration tests against a real Postgres.
@@ -102,17 +100,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: npm
+          cache: yarn
 
       - name: Install dependencies
-        # --no-optional: skip platform-specific optional deps (e.g.
-        # @unrs/resolver-binding-linux-x64-gnu) that the npm Windows
-        # resolver doesn't materialize, but CI's npm on Linux tries to
-        # install and then complains about missing transitive @emnapi/*
-        # entries (EUSAGE). None of @nestjs/cli's runtime code imports
-        # those bindings — they're for terminal rendering in the CLI —
-        # so dropping them is safe for lint/build/test.
-        run: npm ci --no-audit --no-fund --no-optional
+        run: yarn install --frozen-lockfile --non-interactive --network-timeout 600000
 
       - name: Install Postgres client tools
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
@@ -131,9 +122,9 @@ jobs:
           exit 1
 
       - name: Run migrations
-        run: npm run migrate
+        run: yarn migrate
 
       - name: Integration tests
-        run: npm run test:integration
+        run: yarn test:integration
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5433/charon
