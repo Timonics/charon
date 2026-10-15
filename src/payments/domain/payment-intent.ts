@@ -59,6 +59,13 @@ export interface PaymentIntentSnapshot {
   readonly description?: string;
   readonly createdAt: Date;
   readonly status: PaymentStatus;
+  /**
+   * Optimistic-concurrency token. Bumped on every successful UPDATE
+   * by the repository; the in-memory aggregate carries the value it
+   * loaded at read time, and save()'s compare-and-swap throws
+   * OptimisticLockError if the row's version no longer matches.
+   */
+  readonly version: number;
   readonly providerChargeRef?: string;
   readonly refundedAmount: MoneySnapshot;
 }
@@ -98,6 +105,13 @@ export class PaymentIntent {
   /** Running total of everything refunded so far; guards invariant #5. */
   private refundedAmount: Money;
 
+  /**
+   * Optimistic-concurrency token. Set from the snapshot on rehydration
+   * (the row's current version), default 0 for new aggregates. Bumped
+   * after every state-changing call via {@link record}.
+   */
+  private version: number;
+
   private constructor(
     /** Public identifier; safe to expose to clients and logs. */
     readonly intentId: string,
@@ -111,8 +125,10 @@ export class PaymentIntent {
     private status: PaymentStatus,
     /** Provider's charge reference; known once the provider accepted the charge. */
     private providerChargeRef: string | undefined,
+    initialVersion: number = 0,
   ) {
     this.refundedAmount = Money.zero(amount.currency);
+    this.version = initialVersion;
   }
 
   /**
@@ -173,6 +189,7 @@ export class PaymentIntent {
       snapshot.createdAt,
       snapshot.status,
       snapshot.providerChargeRef,
+      snapshot.version,
     );
     intent.refundedAmount = Money.fromSnapshot(snapshot.refundedAmount);
     return intent;
@@ -192,6 +209,7 @@ export class PaymentIntent {
       status: this.status,
       providerChargeRef: this.providerChargeRef,
       refundedAmount: this.refundedAmount.toSnapshot(),
+      version: this.version,
     };
   }
 

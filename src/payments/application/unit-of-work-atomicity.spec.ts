@@ -129,7 +129,7 @@ class FakePoolClient extends TransactionalSqlExecutor {
           result: {
             rows: [{ max_sequence: max }],
             rowCount: max !== null ? 1 : 0,
-          },
+          } as never,
         },
       ];
       try {
@@ -146,7 +146,7 @@ class FakePoolClient extends TransactionalSqlExecutor {
       return Promise.resolve({
         rows: row ? [row as R] : [],
         rowCount: row ? 1 : 0,
-      } as QueryResult<R>);
+      } as unknown as QueryResult<R>);
     }
 
     // SELECT * FROM payment_intents WHERE provider = $1 AND provider_charge_ref = $2
@@ -159,7 +159,7 @@ class FakePoolClient extends TransactionalSqlExecutor {
       return Promise.resolve({
         rows: row ? [row as R] : [],
         rowCount: row ? 1 : 0,
-      } as QueryResult<R>);
+      } as unknown as QueryResult<R>);
     }
 
     // INSERT INTO idempotency_keys
@@ -176,7 +176,7 @@ class FakePoolClient extends TransactionalSqlExecutor {
         ...prior,
         {
           prefix: 'INSERT INTO IDEMPOTENCY_KEYS',
-          result: { rows: [], rowCount },
+          result: { rows: [], rowCount } as never,
         },
       ];
       try {
@@ -193,12 +193,15 @@ class FakePoolClient extends TransactionalSqlExecutor {
       const composite = `${scope}:${key}`;
       const state = this.idempotencyRows.get(composite);
       if (state !== 'completed') {
-        return Promise.resolve({ rows: [], rowCount: 0 } as QueryResult<R>);
+        return Promise.resolve({
+          rows: [],
+          rowCount: 0,
+        } as unknown as QueryResult<R>);
       }
       return Promise.resolve({
         rows: [{ state: 'completed', result: null }],
         rowCount: 1,
-      } as QueryResult<R>);
+      } as unknown as QueryResult<R>);
     }
 
     // UPDATE idempotency_keys ... SET state = 'completed'
@@ -219,7 +222,13 @@ class FakePoolClient extends TransactionalSqlExecutor {
         ...prior,
         {
           prefix: 'UPDATE IDEMPOTENCY_KEYS',
-          result: { rows: [], rowCount },
+          result: {
+            rows: [],
+            rowCount,
+            command: 'UPDATE',
+            oid: 0,
+            fields: [],
+          },
         },
       ];
       try {
@@ -239,7 +248,10 @@ class FakePoolClient extends TransactionalSqlExecutor {
       if (rowCount === 1) {
         this.idempotencyRows.delete(composite);
       }
-      return Promise.resolve({ rows: [], rowCount } as QueryResult<R>);
+      return Promise.resolve({
+        rows: [],
+        rowCount,
+      } as unknown as QueryResult<R>);
     }
 
     // SELECT 1 AS found FROM processed_webhooks
@@ -249,7 +261,7 @@ class FakePoolClient extends TransactionalSqlExecutor {
       return Promise.resolve({
         rows: found ? [{ found: '1' }] : [],
         rowCount: found ? 1 : 0,
-      } as QueryResult<R>);
+      } as unknown as QueryResult<R>);
     }
 
     // INSERT INTO processed_webhooks
@@ -278,10 +290,17 @@ function makeFakePool(client: FakePoolClient): Pool {
   // `connect()` (returns the recording client), and `end()` (no-op,
   // unused by UnitOfWork). Other methods are stubbed to satisfy the
   // Pool type signature without participating in any test assertion.
-  const fake: Pool = {
+  const EMPTY_QUERY_RESULT: QueryResult = {
+    rows: [],
+    rowCount: 0,
+    command: 'SELECT',
+    oid: 0,
+    fields: [],
+  };
+  const fake: object = {
     connect: () => Promise.resolve(client as unknown as PoolClient),
     end: () => Promise.resolve(),
-    query: () => Promise.resolve({ rows: [], rowCount: 0 } as QueryResult),
+    query: () => Promise.resolve(EMPTY_QUERY_RESULT),
     on: () => fake,
     once: () => fake,
     removeListener: () => fake,
@@ -290,7 +309,11 @@ function makeFakePool(client: FakePoolClient): Pool {
     listeners: () => [],
     listenerCount: () => 0,
   };
-  return fake;
+  // Pool has 15+ methods; this fake only implements the four the
+  // production code calls (connect, end, query, plus EventEmitter).
+  // Cast to unknown→Pool at construction since the cast is a lie only
+  // about unused surface area.
+  return fake as unknown as Pool;
 }
 
 // --------------------------------------------------------------------- //
@@ -307,15 +330,27 @@ interface Fixture {
 function makeFixture(): Fixture {
   const client = new FakePoolClient();
   // Default: every write returns rowCount=1 so production guards pass.
-  client.defaultResult = { rows: [], rowCount: 1 };
+  client.defaultResult = {
+    rows: [],
+    rowCount: 1,
+    command: 'INSERT',
+    oid: 0,
+    fields: [],
+  };
 
   const pool = makeFakePool(client);
   const unitOfWork = new UnitOfWork(pool);
+  // The FakePoolClient extends TransactionalSqlExecutor (which implements
+  // SqlExecutor) but its `query` override only matches a subset of the
+  // SqlExecutor overloads, so TypeScript can't narrow the assignment
+  // automatically. We cast at the construction site because we know the
+  // fake's contract matches what the production repos call.
+  const tx = client as unknown as SqlExecutor;
 
-  const intentRepo = new PostgresPaymentIntentRepository(client);
-  const ledgerRepo = new PostgresLedgerRepository(client);
-  const idempotencyRepo = new PostgresIdempotencyStore(client);
-  const processedRepo = new PostgresProcessedWebhookStore(client);
+  const intentRepo = new PostgresPaymentIntentRepository(tx);
+  const ledgerRepo = new PostgresLedgerRepository(tx);
+  const idempotencyRepo = new PostgresIdempotencyStore(tx);
+  const processedRepo = new PostgresProcessedWebhookStore(tx);
   const ledgerAppender = new LedgerAppender(ledgerRepo);
 
   const initiate = new InitiatePaymentUseCase({
@@ -464,6 +499,7 @@ describe('UnitOfWork transaction atomicity (production repos, fake PoolClient)',
       customer_ref: null,
       description: null,
       created_at: new Date('2026-09-21T00:00:00.000Z'),
+      version: '0',
     });
 
     const event = new NormalizedPaymentEvent({

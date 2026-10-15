@@ -63,11 +63,20 @@ describe('Postgres payments infrastructure (integration)', () => {
       ).toBeNull();
     });
 
-    it('upserts on repeated saves', async () => {
+    it('upserts on repeated saves (with a reload between them)', async () => {
       const intent = succeededIntent();
       await repo().save(intent);
-      // Re-saving the same snapshot is idempotent and must not duplicate.
-      await repo().save(intent);
+      // Re-read the aggregate. After the first save, the row's version
+      // is 1; the in-memory aggregate still has version=0 from creation.
+      // Reloading refreshes the version so the second save's
+      // compare-and-swap can match. This is the production pattern:
+      // every use case loads → mutates → saves, never save-twice-without-
+      // re-read. (Save twice without reload would correctly throw
+      // OptimisticLockError — that's the point of the version column.)
+      const reloaded = await repo().findById(intent.intentId);
+      expect(reloaded).not.toBeNull();
+      // Re-saving the reloaded snapshot is idempotent and must not duplicate.
+      await repo().save(reloaded!);
       const { rows } = await pool.query<{ n: number }>(
         'SELECT count(*)::int AS n FROM payment_intents',
       );

@@ -4,6 +4,7 @@ import type { PaymentIntentSnapshot } from '../domain/payment-intent';
 import type { PaymentMethod } from '../domain/payment-method';
 import type { PaymentStatus } from '../domain/payment-status';
 import type { ProviderName } from '../../shared/kernel/provider-name';
+import { OptimisticLockError } from '../../shared/kernel/optimistic-lock.error';
 import type { SqlExecutor } from '../../shared/infrastructure/db';
 import { toSafeInteger, trimChar } from '../../shared/infrastructure/pg-types';
 
@@ -21,6 +22,7 @@ interface PaymentIntentRow {
   customer_ref: string | null;
   description: string | null;
   created_at: Date;
+  version: string;
 }
 
 /**
@@ -30,18 +32,32 @@ interface PaymentIntentRow {
  * STATE is stored; history is never touched here. `save` is an upsert — the
  * aggregate is saved whole, never field-patched, so a save always reflects
  * one complete, consistent command outcome.
+ *
+ * Concurrency: save() is a compare-and-swap on the `version` column.
+ * Without it, two concurrent refund-escrow or refund-payment calls can
+ * both pass the in-memory cumulative-refund check and over-refund a
+ * charged amount. The compare-and-swap makes the second writer fail
+ * loudly with OptimisticLockError; the use case's UnitOfWork rolls
+ * back, and the application layer surfaces the conflict.
  */
 export class PostgresPaymentIntentRepository implements PaymentIntentRepository {
   constructor(private readonly db: SqlExecutor) {}
 
   async save(intent: PaymentIntent): Promise<void> {
     const s = intent.toSnapshot();
-    await this.db.query(
+    // The aggregate's `version` is the PRE-state version — what the
+    // row currently holds (or 0 for a brand-new intent). The compare-
+    // and-swap writes `version = s.version + 1` (post-state) and the
+    // WHERE clause checks `version = s.version`. A concurrent writer
+    // that saved first will have bumped the version, so the WHERE
+    // matches zero rows and we throw OptimisticLockError.
+    const preStateVersion = s.version;
+    const result = await this.db.query(
       `INSERT INTO payment_intents (
          intent_id, idempotency_key, amount_minor, currency, method, provider,
          status, provider_charge_ref, refunded_amount_minor, customer_ref,
-         description, created_at, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         description, created_at, updated_at, version
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        ON CONFLICT (intent_id) DO UPDATE SET
          idempotency_key = EXCLUDED.idempotency_key,
          amount_minor = EXCLUDED.amount_minor,
@@ -53,7 +69,10 @@ export class PostgresPaymentIntentRepository implements PaymentIntentRepository 
          refunded_amount_minor = EXCLUDED.refunded_amount_minor,
          customer_ref = EXCLUDED.customer_ref,
          description = EXCLUDED.description,
-         updated_at = EXCLUDED.updated_at`,
+         updated_at = EXCLUDED.updated_at,
+         version = payment_intents.version + 1
+       WHERE payment_intents.intent_id = EXCLUDED.intent_id
+         AND payment_intents.version = $15`,
       [
         s.intentId,
         s.idempotencyKey,
@@ -68,8 +87,17 @@ export class PostgresPaymentIntentRepository implements PaymentIntentRepository 
         s.description ?? null,
         s.createdAt,
         new Date(),
+        preStateVersion + 1,
+        preStateVersion,
       ],
     );
+    if (result.rowCount === 0) {
+      throw new OptimisticLockError(
+        'PaymentIntent',
+        s.intentId,
+        preStateVersion,
+      );
+    }
   }
 
   async findById(intentId: string): Promise<PaymentIntent | null> {
@@ -127,6 +155,7 @@ function rowToSnapshot(row: PaymentIntentRow): PaymentIntent {
       amount: toSafeInteger(row.refunded_amount_minor, 'refunded_amount_minor'),
       currency: trimChar(row.currency),
     },
+    version: toSafeInteger(row.version, 'version'),
   };
   return PaymentIntent.fromSnapshot(snapshot);
 }

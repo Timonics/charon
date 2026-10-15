@@ -5,8 +5,10 @@ import { assertNextSequence } from '../../ledger/domain/sequence';
 import type { IdempotencyKey } from '../../shared/kernel/idempotency-key';
 import type { DomainError } from '../../shared/kernel/domain-error';
 import type { ProviderName } from '../../shared/kernel/provider-name';
+import type { Pool } from 'pg';
 import type { SqlExecutor } from '../../shared/infrastructure/db';
-import type { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
+import { optimisticSave } from '../../shared/infrastructure/in-memory-cas';
+import { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
 import { RoutingFailedError } from '../domain/errors';
 import type { PaymentIntent } from '../domain/payment-intent';
 import type { IdempotencyStore } from './ports/idempotency-store';
@@ -84,7 +86,7 @@ class InMemoryPaymentIntentRepository implements PaymentIntentRepository {
   private intents = new Map<string, PaymentIntent>();
 
   save(intent: PaymentIntent): Promise<void> {
-    this.intents.set(intent.intentId, intent);
+    optimisticSave(this.intents, intent, (i) => i.intentId, 'PaymentIntent');
     return Promise.resolve();
   }
 
@@ -198,7 +200,13 @@ function makeHarness(): Harness {
  * for this use case live in {@link InitiatePaymentUseCase.transactional}
  * below and use the real `UnitOfWork` + `TransactionalSqlExecutor` pair.
  */
-class InMemoryUnitOfWork implements UnitOfWork {
+class InMemoryUnitOfWork extends UnitOfWork {
+  // Pass a stub pool to the parent — we never call .connect() because
+  // run() is overridden. The pool is required by the UnitOfWork
+  // constructor signature but is unreachable in this subclass.
+  constructor() {
+    super({} as Pool);
+  }
   async run<T>(work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
     // The tx argument is not used by the in-memory fakes (their `with()`
     // ignores it), so any object satisfies the type. Pass an empty stub.

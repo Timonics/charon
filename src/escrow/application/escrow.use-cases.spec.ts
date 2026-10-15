@@ -5,7 +5,9 @@ import { assertNextSequence } from '../../ledger/domain/sequence';
 import type { DomainError } from '../../shared/kernel/domain-error';
 import type { Result } from '../../shared/kernel/result';
 import type { SqlExecutor } from '../../shared/infrastructure/db';
-import type { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
+import { optimisticSave } from '../../shared/infrastructure/in-memory-cas';
+import { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
+import type { Pool } from 'pg';
 import type { IdempotencyKey } from '../../shared/kernel/idempotency-key';
 import type { IdempotencyStore } from '../../payments/application/ports/idempotency-store';
 import { RequestInProgressError } from '../../payments/application/errors';
@@ -18,6 +20,10 @@ import {
   ReleaseEscrowUseCase,
   type ReleaseEscrowCommand,
 } from './release-escrow.use-case';
+import { RefundEscrowUseCase } from './refund-escrow.use-case';
+import { DisputeEscrowUseCase } from './dispute-escrow.use-case';
+import { ResolveDisputeUseCase } from './resolve-dispute.use-case';
+import { CancelEscrowUseCase } from './cancel-escrow.use-case';
 import { ConfirmEscrowHoldUseCase } from './confirm-escrow-hold.use-case';
 import type { EscrowRepository } from './ports/escrow.repository';
 import type { SettledPaymentQuery } from './ports/settled-payment.query';
@@ -75,7 +81,7 @@ class InMemoryEscrowRepository implements EscrowRepository {
   private escrows = new Map<string, Escrow>();
 
   save(escrow: Escrow): Promise<void> {
-    this.escrows.set(escrow.escrowId, escrow);
+    optimisticSave(this.escrows, escrow, (e) => e.escrowId, 'Escrow');
     return Promise.resolve();
   }
 
@@ -147,7 +153,10 @@ class InMemoryLedgerRepository implements LedgerRepository {
 }
 
 /** Noop unit-of-work — runs the callback with a stub tx. */
-class InMemoryUnitOfWork implements UnitOfWork {
+class InMemoryUnitOfWork extends UnitOfWork {
+  constructor() {
+    super({} as Pool);
+  }
   async run<T>(work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
     return work({} as SqlExecutor);
   }
@@ -162,6 +171,10 @@ const INTENT_ID = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
 interface Harness {
   placeHold: PlaceEscrowHoldUseCase;
   release: ReleaseEscrowUseCase;
+  refund: RefundEscrowUseCase;
+  dispute: DisputeEscrowUseCase;
+  resolveDispute: ResolveDisputeUseCase;
+  cancel: CancelEscrowUseCase;
   confirm: ConfirmEscrowHoldUseCase;
   escrows: InMemoryEscrowRepository;
   ledger: InMemoryLedgerRepository;
@@ -184,6 +197,30 @@ function makeHarness(): Harness {
       unitOfWork,
     }),
     release: new ReleaseEscrowUseCase({
+      idempotency,
+      escrows,
+      ledger: appender,
+      unitOfWork,
+    }),
+    refund: new RefundEscrowUseCase({
+      idempotency,
+      escrows,
+      ledger: appender,
+      unitOfWork,
+    }),
+    dispute: new DisputeEscrowUseCase({
+      idempotency,
+      escrows,
+      ledger: appender,
+      unitOfWork,
+    }),
+    resolveDispute: new ResolveDisputeUseCase({
+      idempotency,
+      escrows,
+      ledger: appender,
+      unitOfWork,
+    }),
+    cancel: new CancelEscrowUseCase({
       idempotency,
       escrows,
       ledger: appender,
@@ -466,5 +503,127 @@ describe('ReleaseEscrowUseCase', () => {
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBeInstanceOf(RequestInProgressError);
+  });
+});
+
+describe('RefundEscrowUseCase', () => {
+  it('partially refunds and reports running totals', async () => {
+    const h = makeHarness();
+    const { escrowId } = await heldEscrow(h);
+    const result = unwrap(
+      await h.refund.execute({
+        escrowId,
+        amountMinor: 3_000,
+        currency: 'NGN',
+        idempotencyKey: 'refund-000001',
+      }),
+    );
+    expect(result.state).toBe('HELD');
+    expect(result.refundedToDate).toEqual({ amount: 3_000, currency: 'NGN' });
+    expect(result.availableAmount).toEqual({ amount: 7_000, currency: 'NGN' });
+    const events = h.ledger.all().filter((e) => e.aggregateId === escrowId);
+    expect(events.map((e) => e.eventType)).toContain('EscrowRefunded');
+  });
+
+  it('rejects over-refund (sum > held)', async () => {
+    const h = makeHarness();
+    const { escrowId } = await heldEscrow(h);
+    const over = await h.refund.execute({
+      escrowId,
+      amountMinor: 10_001,
+      currency: 'NGN',
+      idempotencyKey: 'refund-over',
+    });
+    expect(over.ok).toBe(false);
+  });
+});
+
+describe('DisputeEscrowUseCase', () => {
+  it('transitions HELD → DISPUTED and journals EscrowDisputed', async () => {
+    const h = makeHarness();
+    const { escrowId } = await heldEscrow(h);
+    const result = unwrap(
+      await h.dispute.execute({
+        escrowId,
+        idempotencyKey: 'dispute-000001',
+        reason: 'buyer claims non-delivery',
+      }),
+    );
+    expect(result.state).toBe('DISPUTED');
+    const events = h.ledger.all().filter((e) => e.aggregateId === escrowId);
+    expect(events.map((e) => e.eventType)).toContain('EscrowDisputed');
+  });
+
+  it('refuses to dispute a PENDING escrow (no funds to freeze)', async () => {
+    const h = makeHarness();
+    // Don't hold first — escrow is still PENDING.
+    h.settled.settle(INTENT_ID);
+    const placed = unwrap(
+      await h.placeHold.execute(
+        holdCommand({ idempotencyKey: 'place-for-pending' }),
+      ),
+    );
+    const result = await h.dispute.execute({
+      escrowId: placed.escrowId,
+      idempotencyKey: 'dispute-pending',
+      reason: 'test',
+    });
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe('ResolveDisputeUseCase', () => {
+  it('transitions DISPUTED → HELD', async () => {
+    const h = makeHarness();
+    const { escrowId } = await heldEscrow(h);
+    await h.dispute.execute({
+      escrowId,
+      idempotencyKey: 'dispute-for-resolve',
+      reason: 'test',
+    });
+    const result = unwrap(
+      await h.resolveDispute.execute({
+        escrowId,
+        idempotencyKey: 'resolve-000001',
+      }),
+    );
+    expect(result.state).toBe('HELD');
+    const events = h.ledger.all().filter((e) => e.aggregateId === escrowId);
+    expect(events.map((e) => e.eventType)).toContain('EscrowResolved');
+  });
+});
+
+describe('CancelEscrowUseCase', () => {
+  it('cancels a PENDING escrow and journals EscrowCancelled', async () => {
+    const h = makeHarness();
+    h.settled.settle(INTENT_ID);
+    const placed = unwrap(
+      await h.placeHold.execute(
+        holdCommand({ idempotencyKey: 'place-for-cancel' }),
+      ),
+    );
+    const result = unwrap(
+      await h.cancel.execute({
+        escrowId: placed.escrowId,
+        idempotencyKey: 'cancel-000001',
+        reason: 'merchant abandoned checkout',
+      }),
+    );
+    expect(result.state).toBe('CANCELLED');
+    const events = h.ledger
+      .all()
+      .filter((e) => e.aggregateId === placed.escrowId);
+    expect(events.map((e) => e.eventType)).toContain('EscrowCancelled');
+  });
+
+  it('refuses to cancel a HELD escrow (funds are real)', async () => {
+    const h = makeHarness();
+    const { escrowId } = await heldEscrow(h);
+    const result = await h.cancel.execute({
+      escrowId,
+      idempotencyKey: 'cancel-held',
+      reason: 'test',
+    });
+    expect(result.ok).toBe(false);
   });
 });

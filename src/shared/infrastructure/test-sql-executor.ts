@@ -108,8 +108,10 @@ export class RecordingSqlExecutor implements SqlExecutor {
   /**
    * Per-query overrides: the first matching entry (by SQL prefix, case-
    * insensitive) is returned; others fall through to `defaultResult`.
+   * Mutable so tests can push or splice entries mid-test; the wrapped
+   * `query()` re-reads this on every call.
    */
-  public readonly queryResults: Array<{
+  public queryResults: Array<{
     prefix: string;
     result: TestQueryResult;
   }> = [];

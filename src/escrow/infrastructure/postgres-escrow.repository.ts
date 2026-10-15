@@ -3,6 +3,7 @@ import type { EscrowSnapshot } from '../domain/escrow';
 import type { EscrowState } from '../domain/escrow-state';
 import type { EscrowRepository } from '../application/ports/escrow.repository';
 import type { ProviderName } from '../../shared/kernel/provider-name';
+import { OptimisticLockError } from '../../shared/kernel/optimistic-lock.error';
 import type { SqlExecutor } from '../../shared/infrastructure/db';
 import { toSafeInteger, trimChar } from '../../shared/infrastructure/pg-types';
 
@@ -19,30 +20,51 @@ interface EscrowRow {
   refunded_amount_minor: string;
   external_ref: string | null;
   created_at: Date;
+  version: string;
 }
 
 /**
  * Postgres implementation of the Escrow snapshot port. Same semantics as
  * the PaymentIntent repository: whole-aggregate upsert, history untouched,
  * row mapping with validated BIGINT parsing at the boundary.
+ *
+ * Concurrency: save() is a compare-and-swap on the `version` column.
+ * The aggregate carries the version it loaded at read time (via
+ * toSnapshot()), and the UPDATE only succeeds if the row's version
+ * still matches. A concurrent writer that loaded the same version and
+ * saved first will have bumped the version, so this UPDATE matches
+ * zero rows and we throw OptimisticLockError. The use case's
+ * UnitOfWork rolls back; the application layer decides whether to
+ * retry (idempotent commands) or surface a conflict.
  */
 export class PostgresEscrowRepository implements EscrowRepository {
   constructor(private readonly db: SqlExecutor) {}
 
   async save(escrow: Escrow): Promise<void> {
     const s = escrow.toSnapshot();
-    await this.db.query(
+    // The aggregate's `version` is the PRE-state version — the version
+    // the row currently holds (or 0 for a brand-new aggregate whose
+    // row doesn't exist yet). The save() compare-and-swap writes
+    // `version = s.version + 1` (the post-state version), and the
+    // WHERE clause checks `version = s.version` to detect a concurrent
+    // writer that bumped the version between the aggregate's read
+    // and save().
+    const preStateVersion = s.version;
+    const result = await this.db.query(
       `INSERT INTO escrows (
          escrow_id, payment_intent_id, held_amount_minor, currency, provider,
          state, provider_custody_ref, released_amount_minor,
-         refunded_amount_minor, external_ref, created_at, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         refunded_amount_minor, external_ref, created_at, updated_at, version
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        ON CONFLICT (escrow_id) DO UPDATE SET
          state = EXCLUDED.state,
          provider_custody_ref = EXCLUDED.provider_custody_ref,
          released_amount_minor = EXCLUDED.released_amount_minor,
          refunded_amount_minor = EXCLUDED.refunded_amount_minor,
-         updated_at = EXCLUDED.updated_at`,
+         updated_at = EXCLUDED.updated_at,
+         version = escrows.version + 1
+       WHERE escrows.escrow_id = EXCLUDED.escrow_id
+         AND escrows.version = $14`,
       [
         s.escrowId,
         s.paymentIntentId,
@@ -56,8 +78,21 @@ export class PostgresEscrowRepository implements EscrowRepository {
         s.externalRef ?? null,
         s.createdAt,
         new Date(),
+        // New rows: write the post-state version (pre + 1). 0 + 1 = 1.
+        preStateVersion + 1,
+        // For an existing row: the version the aggregate loaded (pre-state).
+        // For a new row: not read by the INSERT path, but pass the same
+        // value for safety.
+        preStateVersion,
       ],
     );
+    // rowCount === 1 means either INSERT or UPDATE succeeded.
+    // rowCount === 0 means ON CONFLICT's WHERE filtered out the UPDATE
+    // (the row's version no longer matches the pre-state version we
+    // expected, because a concurrent writer bumped it).
+    if (result.rowCount === 0) {
+      throw new OptimisticLockError('Escrow', s.escrowId, preStateVersion);
+    }
   }
 
   async findById(escrowId: string): Promise<Escrow | null> {
@@ -109,6 +144,7 @@ function rowToAggregate(row: EscrowRow): Escrow {
       amount: toSafeInteger(row.refunded_amount_minor, 'refunded_amount_minor'),
       currency,
     },
+    version: toSafeInteger(row.version, 'version'),
   };
   return Escrow.fromSnapshot(snapshot);
 }

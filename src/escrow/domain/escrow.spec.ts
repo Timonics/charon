@@ -261,3 +261,111 @@ describe('Escrow event draining', () => {
     expect(escrow.pullEvents()).toHaveLength(0);
   });
 });
+
+/**
+ * The audit's #1 money-loss bug: two concurrent release-escrow calls
+ * that load the same aggregate at the same version and both pass the
+ * in-memory invariant check would BOTH succeed, over-releasing the
+ * held amount. With optimistic concurrency on the persistence layer
+ * (compare-and-swap on the `version` column), the second writer
+ * fails loudly with OptimisticLockError and the UnitOfWork rolls
+ * back, so the ledger and the snapshot stay consistent.
+ *
+ * This test exercises the contract at the in-memory repository level
+ * — the production Postgres repository enforces the same contract
+ * via UPDATE ... WHERE escrow_id = $1 AND version = $2.
+ */
+describe('Escrow optimistic concurrency', () => {
+  it('rejects a save when the in-memory version is stale (concurrent-release simulation)', () => {
+    const repo = new InMemoryEscrowRepository();
+
+    // Seed the escrow at version 0 (Operator A's initial load + save).
+    const a = heldEscrow();
+    repo.save(a);
+
+    // Operator B does a fresh read in parallel — gets version 1
+    // (the post-state of A's save), same paymentIntentId.
+    const b = repo.findById(a.escrowId)!;
+    expect(b.toSnapshot().version).toBe(1);
+
+    // Both A and B mutate independently.
+    a.release(Money.of(5_000, 'NGN')); // A at version 0 in memory
+    b.release(Money.of(3_000, 'NGN')); // B at version 1 in memory
+
+    // A saves first (older snapshot, but the repo's stored is 1, A's
+    // pre-state is 0 → A's UPDATE matches the row at version 0, no,
+    // it doesn't — the repo bumps via setVersion(incomingVersion+1),
+    // so A's save would set the row to version 1, but a real Postgres
+    // save with the production repository's CAS would throw because
+    // the row's current version (1) doesn't match A's pre-state (0).
+    //
+    // In the in-memory fake the CAS semantics ARE: storedVersion
+    // (1) !== incomingVersion (0) → throw.
+    expect(() => repo.save(a)).toThrow(/OptimisticLockError/);
+
+    // B's save with the correct pre-state (1) succeeds; the row's
+    // stored version becomes 2.
+    repo.save(b);
+
+    // Final state: 5_000 from A never persisted (rolled back); 3_000
+    // from B is the only release.
+    const finalEscrow = repo.findById(a.escrowId)!;
+    expect(finalEscrow.releasedToDate.amount).toBe(3_000);
+    expect(finalEscrow.availableAmount.amount).toBe(7_000);
+  });
+
+  it('rejects a double-save on a freshly-created aggregate (in-memory reload pattern)', () => {
+    const repo = new InMemoryEscrowRepository();
+    const escrow = Escrow.create({
+      paymentIntentId: 'pi-double-save',
+      heldAmount: Money.of(10_000, 'NGN'),
+      provider: 'paystack',
+    });
+
+    // First save: brand new aggregate, version is 0 (record() bumped
+    // it conceptually but the pre-state version is 0 because the
+    // repository bumps on save).
+    expect(escrow.toSnapshot().version).toBe(0);
+    repo.save(escrow);
+
+    // Same in-memory aggregate, save again without reload. The repo's
+    // stored version is 1 (post-state); the in-memory version is still
+    // 0 (pre-state). Mismatch → OptimisticLockError.
+    expect(() => repo.save(escrow)).toThrow(/OptimisticLockError/);
+  });
+});
+
+/** Tiny in-memory escrow repo mirroring the production CAS contract. */
+class InMemoryEscrowRepository {
+  private escrows = new Map<string, Escrow>();
+  private versions = new Map<string, number>();
+
+  save(escrow: Escrow): void {
+    const id = escrow.escrowId;
+    const incomingVersion = escrow.toSnapshot().version;
+    const storedVersion = this.versions.get(id);
+    if (storedVersion !== undefined && storedVersion !== incomingVersion) {
+      throw new Error(
+        `OptimisticLockError: Escrow ${id} expected version ${incomingVersion} ` +
+          `but stored version is ${storedVersion}.`,
+      );
+    }
+    this.escrows.set(id, escrow);
+    // Pre-state + 1 = post-state, matching the production `SET version = row.version + 1`.
+    this.versions.set(id, incomingVersion + 1);
+  }
+
+  findById(escrowId: string): Escrow | null {
+    const escrow = this.escrows.get(escrowId);
+    if (!escrow) return null;
+    const storedVersion = this.versions.get(escrowId) ?? 0;
+    // Rehydration: the stored aggregate carries the post-state version.
+    // For a re-read to use the correct pre-state version, the
+    // in-memory aggregate needs the stored version. We rebuild the
+    // snapshot with that version.
+    return Escrow.fromSnapshot({
+      ...escrow.toSnapshot(),
+      version: storedVersion,
+    });
+  }
+}

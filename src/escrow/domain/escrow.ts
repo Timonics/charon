@@ -43,6 +43,13 @@ export interface CreateEscrowInput {
  * Plain-data snapshot of an {@link Escrow}'s current state — the
  * persistence contract between the aggregate and its repository. Movement
  * history is not duplicated here; it lives in the append-only ledger.
+ *
+ * `version` is the optimistic-concurrency token. The repository bumps
+ * it on every successful UPDATE; the in-memory aggregate carries the
+ * value it loaded at read time, and the save() compare-and-swap
+ * throws OptimisticLockError if the row's version no longer matches.
+ * Without this, two concurrent release-escrow calls can both pass
+ * the in-memory invariant check and over-release a held amount.
  */
 export interface EscrowSnapshot {
   readonly escrowId: string;
@@ -55,6 +62,7 @@ export interface EscrowSnapshot {
   readonly providerCustodyRef?: string;
   readonly releasedAmount: MoneySnapshot;
   readonly refundedAmount: MoneySnapshot;
+  readonly version: number;
 }
 
 /**
@@ -95,6 +103,13 @@ export class Escrow {
   /** Provider-side custody reference; known once the hold is confirmed. */
   private providerCustodyRef: string | undefined;
 
+  /**
+   * Optimistic-concurrency token. Set from the snapshot on rehydration
+   * (the row's current version), default 0 for new aggregates. Bumped
+   * after every state-changing call via {@link record}.
+   */
+  private version: number;
+
   private constructor(
     readonly escrowId: string,
     readonly paymentIntentId: string,
@@ -103,10 +118,12 @@ export class Escrow {
     readonly externalRef: string | undefined,
     readonly createdAt: Date,
     initialState: EscrowState,
+    initialVersion: number = 0,
   ) {
     this.releasedAmount = Money.zero(heldAmount.currency);
     this.refundedAmount = Money.zero(heldAmount.currency);
     this.state = initialState;
+    this.version = initialVersion;
   }
 
   /**
@@ -163,6 +180,7 @@ export class Escrow {
       snapshot.externalRef,
       snapshot.createdAt,
       snapshot.state,
+      snapshot.version,
     );
     escrow.providerCustodyRef = snapshot.providerCustodyRef;
     escrow.releasedAmount = Money.fromSnapshot(snapshot.releasedAmount);
@@ -183,6 +201,7 @@ export class Escrow {
       providerCustodyRef: this.providerCustodyRef,
       releasedAmount: this.releasedAmount.toSnapshot(),
       refundedAmount: this.refundedAmount.toSnapshot(),
+      version: this.version,
     };
   }
 

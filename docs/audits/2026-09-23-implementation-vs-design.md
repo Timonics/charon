@@ -1,8 +1,9 @@
 # Charon — implementation audit vs. design proposal (2026-09-23)
 
-> **Status (PR #1 of 4):** UnitOfWork transaction wrapping is complete and
-> proven by 5 atomicity tests against the production Postgres repos with a
-> fake PoolClient. EXPIRED state added to the escrow FSM. Test count went
+> **Status (PR #3 of 4):** Row-level locking on Escrow and PaymentIntent
+> (compare-and-swap on a `version` column) is in. The five previously-missing
+> use cases are now wired: RefundPayment, RefundEscrow, DisputeEscrow,
+> ResolveDispute, CancelEscrow. Test count: 198 unit + 13 integration.
 > from 179 → 187. Branch: `feature/chore/uow-transaction-wrapping`. Staged,
 > no commit yet.
 

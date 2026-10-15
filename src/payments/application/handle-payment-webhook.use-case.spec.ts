@@ -5,8 +5,10 @@ import { assertNextSequence } from '../../ledger/domain/sequence';
 import { NormalizedPaymentEvent } from '../../provider-integration/domain/normalized-payment-event';
 import type { ProviderName } from '../../shared/kernel/provider-name';
 import type { DomainError } from '../../shared/kernel/domain-error';
+import type { Pool } from 'pg';
 import type { SqlExecutor } from '../../shared/infrastructure/db';
-import type { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
+import { optimisticSave } from '../../shared/infrastructure/in-memory-cas';
+import { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
 import { type IdempotencyKey } from '../../shared/kernel/idempotency-key';
 import { IllegalPaymentStatusTransitionError } from '../domain/errors';
 import type { PaymentIntent } from '../domain/payment-intent';
@@ -73,7 +75,7 @@ class InMemoryPaymentIntentRepository implements PaymentIntentRepository {
   private intents = new Map<string, PaymentIntent>();
 
   save(intent: PaymentIntent): Promise<void> {
-    this.intents.set(intent.intentId, intent);
+    optimisticSave(this.intents, intent, (i) => i.intentId, 'PaymentIntent');
     return Promise.resolve();
   }
 
@@ -157,7 +159,10 @@ class InMemoryProcessedWebhookStore implements ProcessedWebhookStore {
 }
 
 /** Noop unit-of-work: just runs the callback with a stub tx. */
-class InMemoryUnitOfWork implements UnitOfWork {
+class InMemoryUnitOfWork extends UnitOfWork {
+  constructor() {
+    super({} as Pool);
+  }
   async run<T>(work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
     return work({} as SqlExecutor);
   }
