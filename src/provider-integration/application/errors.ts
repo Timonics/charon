@@ -75,3 +75,29 @@ export class ProviderApiError extends DomainError {
     super(`${provider} ${operation} failed: ${message}`);
   }
 }
+
+/**
+ * Thrown when a use case routes to a provider whose outbound
+ * gateway adapter is not wired in the composition root. The
+ * `PaymentGatewayPort` is a port — every provider that ever
+ * appears in the routing output (Stripe, Paystack, Flutterwave)
+ * needs an adapter bound at the application boundary. A missing
+ * adapter is a configuration bug, not a runtime condition, so
+ * we throw a typed error rather than a generic 500.
+ *
+ * The fix: add the missing adapter to the
+ * `gateways: Map<ProviderName, PaymentGatewayPort>` passed into
+ * `InitiatePaymentUseCase`. The composition root is the only
+ * place that knows which providers are enabled in the current
+ * deployment.
+ */
+export class MissingGatewayAdapterError extends DomainError {
+  readonly code = 'MISSING_GATEWAY_ADAPTER';
+
+  constructor(readonly provider: string) {
+    super(
+      `No PaymentGatewayPort adapter is wired for provider "${provider}". ` +
+        'Bind one in the composition root before enabling this provider in routing rules.',
+    );
+  }
+}

@@ -37,6 +37,33 @@ import { HandlePaymentWebhookUseCase } from './handle-payment-webhook.use-case';
 import { PostgresPaymentIntentRepository } from '../infrastructure/postgres-payment-intent.repository';
 import { PostgresIdempotencyStore } from '../infrastructure/postgres-idempotency.store';
 import { PostgresProcessedWebhookStore } from '../infrastructure/postgres-processed-webhook.store';
+import { PostgresWebhookInboxStore } from '../../provider-integration/infrastructure/postgres-webhook-inbox.store';
+import type {
+  PaymentGatewayPort,
+  InitializeChargeInput,
+  InitializedCharge,
+} from '../../provider-integration/application/ports/payment-gateway.port';
+import { ok, type Result } from '../../shared/kernel/result';
+import { ProviderName } from '../../shared/kernel/provider-name';
+import { DomainError } from '../../shared/kernel/domain-error';
+import { rehydrateTenantId, type Principal } from '../../shared/kernel/tenant';
+
+/**
+ * The single test principal used across this spec. The test
+ * exercises the UnitOfWork lifecycle, not the auth boundary,
+ * so the principal's exact tenant doesn't matter — we just need
+ * one to satisfy the use-case signature. Production code in
+ * PR-NN2 will read the verified JWT's `org` claim and build the
+ * real Principal at the HTTP boundary.
+ */
+const TEST_TENANT = rehydrateTenantId('a1b2c3d4-1111-4222-8333-444444444444');
+const TEST_PRINCIPAL: Principal = {
+  kind: 'app',
+  appId: 'app-uuid-test',
+  tenantId: TEST_TENANT,
+  scopes: ['payments:write', 'escrows:write'],
+  expiresAt: new Date('2030-01-01T00:00:00Z'),
+};
 import { PostgresLedgerRepository } from '../../ledger/infrastructure/postgres-ledger.repository';
 import { LedgerAppender } from '../../ledger/application/ledger-appender';
 import { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
@@ -95,11 +122,17 @@ class FakePoolClient extends TransactionalSqlExecutor {
     const upper = text.trim().toUpperCase();
 
     // INSERT INTO payment_intents
+    // Stores every column the production repo writes, so the
+    // SELECT projections return a row that satisfies the
+    // production `PaymentIntentRow` shape (and rehydrateTenantId
+    // gets a real UUID, not undefined).
     if (upper.startsWith('INSERT INTO PAYMENT_INTENTS')) {
       this.intentRows.set(values[0] as string, {
         intent_id: values[0],
         status: values[6],
         provider: values[5],
+        provider_charge_ref: values[7] ?? null,
+        tenant_id: values[14] ?? TEST_TENANT,
       });
       return super.query<R>(textOrConfig, maybeValues);
     }
@@ -320,11 +353,55 @@ function makeFakePool(client: FakePoolClient): Pool {
 // Fixture                                                                //
 // --------------------------------------------------------------------- //
 
+/**
+ * Noop gateway adapter for atomicity tests. The use case exercises
+ * the gateway step (it would crash without `gateways` populated),
+ * but this spec doesn't care what the gateway returns — the test
+ * is about the UnitOfWork lifecycle, not the provider round-trip.
+ * The fake echoes the input `reference` so the intent's
+ * `chargeReference` is set to a stable, predictable value.
+ */
+class NoopGatewayAdapter implements PaymentGatewayPort {
+  readonly provider: ProviderName = 'paystack';
+  async initializeCharge(
+    input: InitializeChargeInput,
+  ): Promise<Result<InitializedCharge, DomainError>> {
+    await Promise.resolve();
+    return ok({
+      providerReference: input.reference,
+      checkoutUrl: 'https://checkout.test/atomicity',
+      raw: { testEcho: true },
+    });
+  }
+  async verifyCharge(providerReference: string): Promise<
+    Result<
+      {
+        status: 'PENDING';
+        providerReference: string;
+        amountMinor: number;
+        currency: string;
+        raw: unknown;
+      },
+      DomainError
+    >
+  > {
+    await Promise.resolve();
+    return ok({
+      status: 'PENDING',
+      providerReference,
+      amountMinor: 0,
+      currency: 'NGN',
+      raw: { testEcho: true },
+    });
+  }
+}
+
 interface Fixture {
   client: FakePoolClient;
   unitOfWork: UnitOfWork;
   initiate: InitiatePaymentUseCase;
   webhook: HandlePaymentWebhookUseCase;
+  inboxRepo: PostgresWebhookInboxStore;
 }
 
 function makeFixture(): Fixture {
@@ -351,22 +428,37 @@ function makeFixture(): Fixture {
   const ledgerRepo = new PostgresLedgerRepository(tx);
   const idempotencyRepo = new PostgresIdempotencyStore(tx);
   const processedRepo = new PostgresProcessedWebhookStore(tx);
+  // The inbox share `tx` with everything else so all four writes
+  // (intent.save, ledger.append, inbox.recordVerifiedWebhook,
+  // processed.markProcessed) commit or roll back together.
+  const inboxRepo = new PostgresWebhookInboxStore(tx);
   const ledgerAppender = new LedgerAppender(ledgerRepo);
 
+  // The gateway adapter is faked in this spec — the test
+  // exercises the UnitOfWork lifecycle, not the provider
+  // round-trip. The fake echoes the input reference, which is
+  // good enough to make `markProcessing` produce a stable
+  // `chargeReference` for the webhook that follows.
+  const gateway: PaymentGatewayPort = new NoopGatewayAdapter();
   const initiate = new InitiatePaymentUseCase({
+    principal: TEST_PRINCIPAL,
     idempotency: idempotencyRepo,
     intents: intentRepo,
     ledger: ledgerAppender,
+    gateways: new Map<ProviderName, PaymentGatewayPort>([
+      [gateway.provider, gateway],
+    ]),
     unitOfWork,
   });
   const webhook = new HandlePaymentWebhookUseCase({
     intents: intentRepo,
     ledger: ledgerAppender,
     processedWebhooks: processedRepo,
+    webhookInbox: inboxRepo,
     unitOfWork,
   });
 
-  return { client, unitOfWork, initiate, webhook };
+  return { client, unitOfWork, initiate, webhook, inboxRepo };
 }
 
 // --------------------------------------------------------------------- //
@@ -500,6 +592,7 @@ describe('UnitOfWork transaction atomicity (production repos, fake PoolClient)',
       description: null,
       created_at: new Date('2026-09-21T00:00:00.000Z'),
       version: '0',
+      tenant_id: TEST_TENANT,
     });
 
     const event = new NormalizedPaymentEvent({

@@ -4,6 +4,7 @@ import { DomainEvent } from '../../shared/kernel/domain-event';
 import type { IdempotencyKey } from '../../shared/kernel/idempotency-key';
 import { Money } from '../../shared/kernel/money';
 import type { ProviderName } from '../../shared/kernel/provider-name';
+import { type TenantId } from '../../shared/kernel/tenant';
 import {
   InvalidPaymentIntentError,
   RefundExceedsChargedAmountError,
@@ -30,6 +31,14 @@ import type { MoneySnapshot } from '../../shared/kernel/money';
  * this service should ever be in.
  */
 export interface CreatePaymentIntentInput {
+  /**
+   * The Cerberus Organization UUID that owns this intent. Required
+   * — there is no business state that is "owned by nobody". The
+   * use case that constructs the input resolves this from the
+   * verified JWT's `org` claim, so a caller cannot forge a
+   * tenant id and authenticate against another org's data.
+   */
+  readonly tenantId: TenantId;
   /** Charged amount. Must be positive; zero is rejected. */
   readonly amount: Money;
   readonly method: PaymentMethod;
@@ -51,6 +60,12 @@ export interface CreatePaymentIntentInput {
  */
 export interface PaymentIntentSnapshot {
   readonly intentId: string;
+  /**
+   * Tenant ownership. Persisted as a UUID column; the in-memory
+   * aggregate carries the branded `TenantId` so the use case can
+   * typecheck ownership without re-validating the column shape.
+   */
+  readonly tenantId: TenantId;
   readonly amount: MoneySnapshot;
   readonly method: PaymentMethod;
   readonly provider: ProviderName;
@@ -115,6 +130,15 @@ export class PaymentIntent {
   private constructor(
     /** Public identifier; safe to expose to clients and logs. */
     readonly intentId: string,
+    /**
+     * The Cerberus Organization UUID that owns this intent. Set
+     * at creation from the verified JWT's `org` claim and never
+     * changes for the life of the aggregate — moving an intent
+     * between tenants is not a state this service should ever
+     * be in. Use case asserts `principal.tenantId === this.tenantId`
+     * before every state-changing call.
+     */
+    readonly tenantId: TenantId,
     readonly amount: Money,
     readonly method: PaymentMethod,
     readonly provider: ProviderName,
@@ -144,6 +168,7 @@ export class PaymentIntent {
 
     const intent = new PaymentIntent(
       randomUUID(),
+      input.tenantId,
       input.amount,
       input.method,
       input.provider,
@@ -180,6 +205,7 @@ export class PaymentIntent {
   static fromSnapshot(snapshot: PaymentIntentSnapshot): PaymentIntent {
     const intent = new PaymentIntent(
       snapshot.intentId,
+      snapshot.tenantId,
       Money.fromSnapshot(snapshot.amount),
       snapshot.method,
       snapshot.provider,
@@ -199,6 +225,7 @@ export class PaymentIntent {
   toSnapshot(): PaymentIntentSnapshot {
     return {
       intentId: this.intentId,
+      tenantId: this.tenantId,
       amount: this.amount.toSnapshot(),
       method: this.method,
       provider: this.provider,

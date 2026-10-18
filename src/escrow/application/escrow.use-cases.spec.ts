@@ -33,6 +33,23 @@ import {
   PaymentNotSettledError,
 } from './errors';
 
+import { rehydrateTenantId, type Principal } from '../../shared/kernel/tenant';
+
+/**
+ * The single test principal used across this spec. The escrow
+ * use cases read `principal.tenantId` and stamp it onto the
+ * freshly-created escrow (place-hold) or assert it matches the
+ * loaded escrow (release / refund / dispute / cancel / resolve).
+ */
+const TEST_TENANT = rehydrateTenantId('a1b2c3d4-1111-4222-8333-444444444444');
+const TEST_PRINCIPAL: Principal = {
+  kind: 'app',
+  appId: 'app-uuid-test',
+  tenantId: TEST_TENANT,
+  scopes: ['escrows:write', 'escrows:release'],
+  expiresAt: new Date('2030-01-01T00:00:00Z'),
+};
+
 // --------------------------------------------------------------------- //
 // In-memory fakes, mirroring the port contracts (same role as the fakes   //
 // in the Payments specs).                                                 //
@@ -190,6 +207,7 @@ function makeHarness(): Harness {
   const unitOfWork = new InMemoryUnitOfWork();
   return {
     placeHold: new PlaceEscrowHoldUseCase({
+      principal: TEST_PRINCIPAL,
       idempotency,
       escrows,
       ledger: appender,

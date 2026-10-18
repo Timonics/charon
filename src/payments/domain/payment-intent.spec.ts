@@ -3,6 +3,7 @@ import {
   parseIdempotencyKey,
   type IdempotencyKey,
 } from '../../shared/kernel/idempotency-key';
+import { rehydrateTenantId } from '../../shared/kernel/tenant';
 import {
   IllegalPaymentStatusTransitionError,
   InvalidPaymentIntentError,
@@ -27,10 +28,19 @@ function idempotencyKey(raw: string): IdempotencyKey {
 
 const IDEMPOTENCY_KEY = idempotencyKey('test-intent-0001');
 
+/**
+ * The single test tenant used in domain tests. The aggregate
+ * requires a `tenantId` on creation, so every fixture must stamp
+ * a known value. Domain tests don't exercise the auth boundary,
+ * so any valid UUID is fine.
+ */
+const TEST_TENANT = rehydrateTenantId('a1b2c3d4-1111-4222-8333-444444444444');
+
 function makeInput(
   overrides: Partial<CreatePaymentIntentInput> = {},
 ): CreatePaymentIntentInput {
   return {
+    tenantId: TEST_TENANT,
     amount: Money.of(10_000, 'NGN'),
     method: 'card',
     provider: 'paystack',

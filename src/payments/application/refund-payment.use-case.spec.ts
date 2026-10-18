@@ -5,6 +5,7 @@ import type { IdempotencyKey } from '../../shared/kernel/idempotency-key';
 import type { DomainError } from '../../shared/kernel/domain-error';
 import type { ProviderName } from '../../shared/kernel/provider-name';
 import { Money } from '../../shared/kernel/money';
+import { rehydrateTenantId } from '../../shared/kernel/tenant';
 import type { Pool } from 'pg';
 import type { SqlExecutor } from '../../shared/infrastructure/db';
 import { optimisticSave } from '../../shared/infrastructure/in-memory-cas';
@@ -138,8 +139,27 @@ function parseKeyOrFallback(s: string): IdempotencyKey {
   return r.value;
 }
 
+/**
+ * The single test tenant used in this spec. The refund use case
+ * does not yet read `principal.tenantId` (deferred to PR-NN2),
+ * but the aggregate's `tenantId` field is required, so the
+ function parseKeyOrFallback(s: string): IdempotencyKey {
+   const r = parseIdempotencyKey(s);
+   if (!r.ok) throw new Error(`test key ${s} failed to parse: ${r.error.code}`);
+   return r.value;
+ }
+
+ /**
+  * The single test tenant used in this spec. The refund use case
+  * does not yet read `principal.tenantId` (deferred to PR-NN2),
+  * but the aggregate's `tenantId` field is required, so the
+  * fixture must stamp a known value.
+  */
+const TEST_TENANT = rehydrateTenantId('a1b2c3d4-1111-4222-8333-444444444444');
+
 function succeededIntent(id: string): PaymentIntent {
   const intent = PaymentIntent.create({
+    tenantId: TEST_TENANT,
     amount: Money.of(40_000, 'NGN'),
     method: 'card',
     provider: 'paystack',
@@ -188,6 +208,7 @@ describe('RefundPaymentUseCase', () => {
   it('rejects refund of an INITIATED intent (only SUCCEEDED can be refunded)', async () => {
     const f = makeFixture();
     const intent = PaymentIntent.create({
+      tenantId: TEST_TENANT,
       amount: Money.of(40_000, 'NGN'),
       method: 'card',
       provider: 'paystack',

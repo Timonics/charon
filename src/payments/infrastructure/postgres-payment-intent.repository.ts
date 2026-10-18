@@ -5,6 +5,7 @@ import type { PaymentMethod } from '../domain/payment-method';
 import type { PaymentStatus } from '../domain/payment-status';
 import type { ProviderName } from '../../shared/kernel/provider-name';
 import { OptimisticLockError } from '../../shared/kernel/optimistic-lock.error';
+import { rehydrateTenantId } from '../../shared/kernel/tenant';
 import type { SqlExecutor } from '../../shared/infrastructure/db';
 import { toSafeInteger, trimChar } from '../../shared/infrastructure/pg-types';
 
@@ -23,6 +24,7 @@ interface PaymentIntentRow {
   description: string | null;
   created_at: Date;
   version: string;
+  tenant_id: string;
 }
 
 /**
@@ -56,8 +58,8 @@ export class PostgresPaymentIntentRepository implements PaymentIntentRepository 
       `INSERT INTO payment_intents (
          intent_id, idempotency_key, amount_minor, currency, method, provider,
          status, provider_charge_ref, refunded_amount_minor, customer_ref,
-         description, created_at, updated_at, version
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         description, created_at, updated_at, version, tenant_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        ON CONFLICT (intent_id) DO UPDATE SET
          idempotency_key = EXCLUDED.idempotency_key,
          amount_minor = EXCLUDED.amount_minor,
@@ -72,7 +74,7 @@ export class PostgresPaymentIntentRepository implements PaymentIntentRepository 
          updated_at = EXCLUDED.updated_at,
          version = payment_intents.version + 1
        WHERE payment_intents.intent_id = EXCLUDED.intent_id
-         AND payment_intents.version = $15`,
+         AND payment_intents.version = $16`,
       [
         s.intentId,
         s.idempotencyKey,
@@ -88,6 +90,7 @@ export class PostgresPaymentIntentRepository implements PaymentIntentRepository 
         s.createdAt,
         new Date(),
         preStateVersion + 1,
+        s.tenantId,
         preStateVersion,
       ],
     );
@@ -138,6 +141,7 @@ export class PostgresPaymentIntentRepository implements PaymentIntentRepository 
 function rowToSnapshot(row: PaymentIntentRow): PaymentIntent {
   const snapshot: PaymentIntentSnapshot = {
     intentId: row.intent_id,
+    tenantId: rehydrateTenantId(row.tenant_id),
     amount: {
       amount: toSafeInteger(row.amount_minor, 'amount_minor'),
       currency: trimChar(row.currency),

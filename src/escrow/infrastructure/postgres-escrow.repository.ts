@@ -4,6 +4,7 @@ import type { EscrowState } from '../domain/escrow-state';
 import type { EscrowRepository } from '../application/ports/escrow.repository';
 import type { ProviderName } from '../../shared/kernel/provider-name';
 import { OptimisticLockError } from '../../shared/kernel/optimistic-lock.error';
+import { rehydrateTenantId } from '../../shared/kernel/tenant';
 import type { SqlExecutor } from '../../shared/infrastructure/db';
 import { toSafeInteger, trimChar } from '../../shared/infrastructure/pg-types';
 
@@ -21,6 +22,7 @@ interface EscrowRow {
   external_ref: string | null;
   created_at: Date;
   version: string;
+  tenant_id: string;
 }
 
 /**
@@ -54,8 +56,9 @@ export class PostgresEscrowRepository implements EscrowRepository {
       `INSERT INTO escrows (
          escrow_id, payment_intent_id, held_amount_minor, currency, provider,
          state, provider_custody_ref, released_amount_minor,
-         refunded_amount_minor, external_ref, created_at, updated_at, version
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         refunded_amount_minor, external_ref, created_at, updated_at, version,
+         tenant_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        ON CONFLICT (escrow_id) DO UPDATE SET
          state = EXCLUDED.state,
          provider_custody_ref = EXCLUDED.provider_custody_ref,
@@ -64,7 +67,7 @@ export class PostgresEscrowRepository implements EscrowRepository {
          updated_at = EXCLUDED.updated_at,
          version = escrows.version + 1
        WHERE escrows.escrow_id = EXCLUDED.escrow_id
-         AND escrows.version = $14`,
+         AND escrows.version = $15`,
       [
         s.escrowId,
         s.paymentIntentId,
@@ -80,6 +83,7 @@ export class PostgresEscrowRepository implements EscrowRepository {
         new Date(),
         // New rows: write the post-state version (pre + 1). 0 + 1 = 1.
         preStateVersion + 1,
+        s.tenantId,
         // For an existing row: the version the aggregate loaded (pre-state).
         // For a new row: not read by the INSERT path, but pass the same
         // value for safety.
@@ -126,6 +130,7 @@ function rowToAggregate(row: EscrowRow): Escrow {
   const currency = trimChar(row.currency);
   const snapshot: EscrowSnapshot = {
     escrowId: row.escrow_id,
+    tenantId: rehydrateTenantId(row.tenant_id),
     paymentIntentId: row.payment_intent_id,
     heldAmount: {
       amount: toSafeInteger(row.held_amount_minor, 'held_amount_minor'),

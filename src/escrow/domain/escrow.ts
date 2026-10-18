@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { DomainEvent } from '../../shared/kernel/domain-event';
 import { Money, type MoneySnapshot } from '../../shared/kernel/money';
 import type { ProviderName } from '../../shared/kernel/provider-name';
+import type { TenantId } from '../../shared/kernel/tenant';
 import {
   InvalidEscrowOperationError,
   IllegalEscrowStateTransitionError,
@@ -31,6 +32,14 @@ export interface CreateEscrowInput {
    * types (cross-context references are by identity, per DDD).
    */
   readonly paymentIntentId: string;
+  /**
+   * The Cerberus Organization UUID that owns this escrow. Required —
+   * mirrors the same tenancy invariant as `PaymentIntent.tenantId`
+   * (every payment has a tenant; every escrow is held against a
+   * payment, so the escrow inherits the payment's tenant). Use
+   * case asserts ownership before every state-changing call.
+   */
+  readonly tenantId: TenantId;
   /** The amount to be held. Must be positive; fixed for the life of the escrow. */
   readonly heldAmount: Money;
   /** Provider whose custody primitive secures the hold. */
@@ -53,6 +62,8 @@ export interface CreateEscrowInput {
  */
 export interface EscrowSnapshot {
   readonly escrowId: string;
+  /** Tenant ownership. Mirrored from the underlying PaymentIntent. */
+  readonly tenantId: TenantId;
   readonly paymentIntentId: string;
   readonly heldAmount: MoneySnapshot;
   readonly provider: ProviderName;
@@ -112,6 +123,14 @@ export class Escrow {
 
   private constructor(
     readonly escrowId: string,
+    /**
+     * The Cerberus Organization UUID that owns this escrow. Set
+     * at creation from the underlying PaymentIntent's tenantId
+     * and never changes for the life of the aggregate. Use case
+     * asserts `principal.tenantId === this.tenantId` before every
+     * state-changing call.
+     */
+    readonly tenantId: TenantId,
     readonly paymentIntentId: string,
     readonly heldAmount: Money,
     readonly provider: ProviderName,
@@ -144,6 +163,7 @@ export class Escrow {
 
     const escrow = new Escrow(
       randomUUID(),
+      input.tenantId,
       input.paymentIntentId,
       input.heldAmount,
       input.provider,
@@ -174,6 +194,7 @@ export class Escrow {
   static fromSnapshot(snapshot: EscrowSnapshot): Escrow {
     const escrow = new Escrow(
       snapshot.escrowId,
+      snapshot.tenantId,
       snapshot.paymentIntentId,
       Money.fromSnapshot(snapshot.heldAmount),
       snapshot.provider,
@@ -192,6 +213,7 @@ export class Escrow {
   toSnapshot(): EscrowSnapshot {
     return {
       escrowId: this.escrowId,
+      tenantId: this.tenantId,
       paymentIntentId: this.paymentIntentId,
       heldAmount: this.heldAmount.toSnapshot(),
       provider: this.provider,

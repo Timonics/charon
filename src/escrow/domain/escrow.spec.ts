@@ -1,4 +1,5 @@
 import { Money } from '../../shared/kernel/money';
+import { rehydrateTenantId } from '../../shared/kernel/tenant';
 import {
   InvalidEscrowOperationError,
   IllegalEscrowStateTransitionError,
@@ -16,10 +17,14 @@ import {
 
 const INTENT_ID = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
 
+/** Single test tenant used by every fixture in this spec. */
+const TEST_TENANT = rehydrateTenantId('a1b2c3d4-1111-4222-8333-444444444444');
+
 function makeInput(
   overrides: Partial<CreateEscrowInput> = {},
 ): CreateEscrowInput {
   return {
+    tenantId: TEST_TENANT,
     paymentIntentId: INTENT_ID,
     heldAmount: Money.of(10_000, 'NGN'),
     provider: 'paystack',
@@ -317,6 +322,7 @@ describe('Escrow optimistic concurrency', () => {
   it('rejects a double-save on a freshly-created aggregate (in-memory reload pattern)', () => {
     const repo = new InMemoryEscrowRepository();
     const escrow = Escrow.create({
+      tenantId: TEST_TENANT,
       paymentIntentId: 'pi-double-save',
       heldAmount: Money.of(10_000, 'NGN'),
       provider: 'paystack',

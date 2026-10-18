@@ -9,16 +9,121 @@ import type { Pool } from 'pg';
 import type { SqlExecutor } from '../../shared/infrastructure/db';
 import { optimisticSave } from '../../shared/infrastructure/in-memory-cas';
 import { UnitOfWork } from '../../shared/infrastructure/unit-of-work';
+import { err, ok, type Result } from '../../shared/kernel/result';
 import { RoutingFailedError } from '../domain/errors';
 import type { PaymentIntent } from '../domain/payment-intent';
 import type { IdempotencyStore } from './ports/idempotency-store';
 import type { PaymentIntentRepository } from './ports/payment-intent.repository';
+import type {
+  PaymentGatewayPort,
+  InitializedCharge,
+  InitializeChargeInput,
+} from '../../provider-integration/application/ports/payment-gateway.port';
+import { InitiatePaymentUseCase } from './initiate-payment.use-case';
 import {
-  InitiatePaymentUseCase,
   type InitiatePaymentCommand,
   type InitiatePaymentResult,
 } from './initiate-payment.use-case';
 import { RequestInProgressError } from './errors';
+
+/**
+ * In-memory {@link PaymentGatewayPort} for use-case tests.
+ * Returns the input `reference` as `providerReference` (matches
+ * Paystack's contract) and records every call so specs can
+ * assert on inputs. Override the result via `setNext` or
+ * `setPersistentFailure` to exercise failure paths.
+ *
+ * Lives in the spec file (not a shared test-helpers module)
+ * because the existing codebase pattern inlines fakes per
+ * spec. The class is small; the duplication is bounded to
+ * `handle-payment-webhook.use-case.spec.ts`,
+ * `unit-of-work-atomicity.spec.ts`, and the payments integration
+ * spec, where the same minimal fake is repeated.
+ */
+import { rehydrateTenantId, type Principal } from '../../shared/kernel/tenant';
+
+/**
+ * The single test principal used across this spec. The
+ * InitiatePayment use case reads `principal.tenantId` and stamps
+ * it onto the freshly-created intent. Production code in PR-NN2
+ * will read the verified JWT's `org` claim and build the real
+ * Principal at the HTTP boundary.
+ */
+const TEST_TENANT = rehydrateTenantId('a1b2c3d4-1111-4222-8333-444444444444');
+const TEST_PRINCIPAL: Principal = {
+  kind: 'app',
+  appId: 'app-uuid-test',
+  tenantId: TEST_TENANT,
+  scopes: ['payments:write', 'escrows:write'],
+  expiresAt: new Date('2030-01-01T00:00:00Z'),
+};
+
+class RecordingGatewayAdapter implements PaymentGatewayPort {
+  readonly provider: ProviderName;
+  readonly calls: InitializeChargeInput[] = [];
+  private next: Result<InitializedCharge, DomainError> | null = null;
+  private persistent: DomainError | null = null;
+
+  constructor(provider: ProviderName = 'paystack') {
+    this.provider = provider;
+  }
+
+  setNext(result: Result<InitializedCharge, DomainError>): void {
+    this.next = result;
+  }
+
+  setPersistentFailure(error: DomainError): void {
+    this.persistent = error;
+  }
+
+  async initializeCharge(
+    input: InitializeChargeInput,
+  ): Promise<Result<InitializedCharge, DomainError>> {
+    await Promise.resolve();
+    this.calls.push(input);
+    if (this.persistent) return err(this.persistent);
+    if (this.next) {
+      const r = this.next;
+      this.next = null;
+      return r;
+    }
+    return ok({
+      providerReference: input.reference,
+      checkoutUrl: 'https://checkout.test/inmem',
+      raw: { testEcho: true, sentAmountMinor: input.amountMinor },
+    });
+  }
+
+  async verifyCharge(providerReference: string): Promise<
+    Result<
+      {
+        status: 'PENDING';
+        providerReference: string;
+        amountMinor: number;
+        currency: string;
+        raw: unknown;
+      },
+      DomainError
+    >
+  > {
+    await Promise.resolve();
+    return ok({
+      status: 'PENDING',
+      providerReference,
+      amountMinor: 0,
+      currency: 'NGN',
+      raw: { testEcho: true },
+    });
+  }
+}
+
+function gatewayMap(
+  entries: ReadonlyArray<PaymentGatewayPort>,
+): ReadonlyMap<ProviderName, PaymentGatewayPort> {
+  const m = new Map<ProviderName, PaymentGatewayPort>();
+  for (const a of entries) m.set(a.provider, a);
+  return m;
+}
 
 // --------------------------------------------------------------------- //
 // In-memory fakes. These are the contract tests for the ports: if the     //
@@ -178,19 +283,30 @@ interface Harness {
   intents: InMemoryPaymentIntentRepository;
   ledger: InMemoryLedgerRepository;
   idempotency: InMemoryIdempotencyStore;
+  gateways: RecordingGatewayAdapter;
 }
 
 function makeHarness(): Harness {
   const intents = new InMemoryPaymentIntentRepository();
   const ledger = new InMemoryLedgerRepository();
   const idempotency = new InMemoryIdempotencyStore();
+  // The test exercises routing across the three providers in
+  // DEFAULT_ROUTING_RULES. Bind a gateway for each so routing
+  // failures (a) surface as RoutingFailedError, not as the
+  // missing-gateway path, and (b) the retry path can actually
+  // call a different provider.
+  const gateways = new RecordingGatewayAdapter();
+  const gateways2 = new RecordingGatewayAdapter('flutterwave');
+  const gateways3 = new RecordingGatewayAdapter('stripe');
   const useCase = new InitiatePaymentUseCase({
+    principal: TEST_PRINCIPAL,
     idempotency,
     intents,
     ledger: new LedgerAppender(ledger),
+    gateways: gatewayMap([gateways, gateways2, gateways3]),
     unitOfWork: new InMemoryUnitOfWork(),
   });
-  return { useCase, intents, ledger, idempotency };
+  return { useCase, intents, ledger, idempotency, gateways };
 }
 
 /**
@@ -233,9 +349,10 @@ describe('InitiatePaymentUseCase', () => {
 
     const result = unwrap(await useCase.execute(makeCommand()));
 
-    expect(result.status).toBe('INITIATED');
+    expect(result.status).toBe('PROCESSING');
     expect(result.provider).toBe('paystack');
     expect(result.amountMinor).toBe(25_000);
+    expect(result.providerReference).toBeTruthy();
     expect(intents.size).toBe(1);
 
     const entries = ledger.all();
@@ -270,9 +387,11 @@ describe('InitiatePaymentUseCase', () => {
     );
 
     const useCase = new InitiatePaymentUseCase({
+      principal: TEST_PRINCIPAL,
       idempotency,
       intents: new InMemoryPaymentIntentRepository(),
       ledger: new LedgerAppender(new InMemoryLedgerRepository()),
+      gateways: gatewayMap([new RecordingGatewayAdapter()]),
       unitOfWork: new InMemoryUnitOfWork(),
     });
 

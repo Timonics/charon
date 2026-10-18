@@ -16,6 +16,7 @@ import {
 } from './errors';
 import type { PaymentIntentRepository } from './ports/payment-intent.repository';
 import type { ProcessedWebhookStore } from './ports/processed-webhook-store';
+import type { WebhookInboxStore } from '../../provider-integration/application/ports/webhook-inbox.store';
 
 /** What happened to the webhook; safe to log and to return to adapters. */
 export type WebhookHandlingResult =
@@ -27,6 +28,14 @@ export interface HandlePaymentWebhookDeps {
   readonly intents: PaymentIntentRepository;
   readonly ledger: LedgerAppender;
   readonly processedWebhooks: ProcessedWebhookStore;
+  /**
+   * Append-only inbox of every verified webhook. Written in the same
+   * unit of work as the dedup marker so a SequenceGapError repair can
+   * later reconstruct the ledger from this table alone. See
+   * `provider-integration/application/ports/webhook-inbox.store.ts`
+   * for the full rationale.
+   */
+  readonly webhookInbox: WebhookInboxStore;
   /**
    * Wraps the persistence portion of the handler (snapshot save + ledger
    * append + processed marker) in a single database transaction. The
@@ -102,6 +111,7 @@ export class HandlePaymentWebhookUseCase {
           const intents = this.deps.intents.with(tx);
           const ledger = this.deps.ledger.with(tx);
           const processed = this.deps.processedWebhooks.with(tx);
+          const inbox = this.deps.webhookInbox.with(tx);
           // Intent snapshot is unchanged — but we re-save to keep the
           // access pattern uniform and prove the marker write commits
           // atomically with any future snapshot update.
@@ -111,6 +121,10 @@ export class HandlePaymentWebhookUseCase {
             intent.intentId,
             intent.pullEvents().map(serializePaymentEvent),
           );
+          // Inbox write is idempotent on (provider, event_id); a
+          // redelivery that previously wrote the inbox row is a no-op
+          // here, matching the dedup marker's idempotency.
+          await inbox.recordVerifiedWebhook(event);
           await processed.markProcessed(event.eventId);
         });
         return ok({ outcome: 'ALREADY_IN_TARGET_STATE' });
@@ -118,17 +132,29 @@ export class HandlePaymentWebhookUseCase {
       return err(error as DomainError);
     }
 
-    // --- Defense 5: persist snapshot + journal + marker, atomically --------
+    // --- Defense 5: persist snapshot + journal + marker + inbox, atomically -
+    // The inbox write belongs here, not earlier, because the inbox row
+    // should reflect a verified event that the system actually acted
+    // on. If a redelivery short-circuits at Defense 1 (DUPLICATE_IGNORED)
+    // we deliberately do NOT write to the inbox — the original
+    // delivery's row is already there.
     await this.deps.unitOfWork.run(async (tx) => {
       const intents = this.deps.intents.with(tx);
       const ledger = this.deps.ledger.with(tx);
       const processed = this.deps.processedWebhooks.with(tx);
+      const inbox = this.deps.webhookInbox.with(tx);
       await intents.save(intent);
       await ledger.append(
         'PaymentIntent',
         intent.intentId,
         intent.pullEvents().map(serializePaymentEvent),
       );
+      // The inbox row is what the SequenceGapError repair reads
+      // back when the ledger is missing a sequence. Written here,
+      // in the same UoW as the journal entry, so a crash between
+      // these two lines leaves the ledger WITHOUT a row that the
+      // inbox DOESN'T have — making the repair path observable.
+      await inbox.recordVerifiedWebhook(event);
       await processed.markProcessed(event.eventId);
     });
 

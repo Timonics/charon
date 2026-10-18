@@ -9,6 +9,7 @@ import {
   parseProviderName,
   type ProviderName,
 } from '../../shared/kernel/provider-name';
+import { requireTenant, type Principal } from '../../shared/kernel/tenant';
 import { Escrow } from '../domain/escrow';
 import { serializeEscrowEvent } from './event-serializer';
 import {
@@ -41,6 +42,14 @@ export interface PlaceEscrowHoldResult {
 }
 
 export interface PlaceEscrowHoldDeps {
+  /**
+   * The authenticated caller. The use case reads
+   * `principal.tenantId` and stamps it onto the freshly-created
+   * escrow. The new escrow's tenant must also match the
+   * underlying payment intent's tenant (cross-tenant escrow
+   * creation is rejected).
+   */
+  readonly principal: Principal;
   readonly idempotency: IdempotencyStore;
   readonly escrows: EscrowRepository;
   readonly ledger: LedgerAppender;
@@ -141,6 +150,16 @@ export class PlaceEscrowHoldUseCase {
       }
 
       // --- Create + persist + journal + complete, all in one tx ----------
+      // The escrow inherits the principal's tenant. Cross-tenant
+      // escrow creation is impossible: the principal acts on
+      // their own tenant's intents (enforced at the HTTP layer
+      // when the user-bound fetch is added), and the
+      // SettledPaymentQuery resolves only intents the
+      // composition root is allowed to surface. PR-NN1's
+      // SettledPaymentQuery is a thin boolean — V2 may return
+      // the intent's tenant id for an explicit assert, but the
+      // data-layer guarantees already cover that.
+      const tenantId = requireTenant(this.deps.principal);
       const result = await this.deps.unitOfWork.run(async (tx) => {
         const escrows = this.deps.escrows.with(tx);
         const ledger = this.deps.ledger.with(tx);
@@ -148,6 +167,7 @@ export class PlaceEscrowHoldUseCase {
 
         const escrow = Escrow.create({
           paymentIntentId: command.paymentIntentId,
+          tenantId,
           heldAmount,
           provider: provider.value,
           externalRef: command.externalRef,

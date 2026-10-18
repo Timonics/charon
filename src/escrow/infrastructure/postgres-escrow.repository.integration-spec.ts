@@ -1,4 +1,5 @@
 import { Money } from '../../shared/kernel/money';
+import { rehydrateTenantId, type Principal } from '../../shared/kernel/tenant';
 import { Escrow } from '../domain/escrow';
 import { ConfirmEscrowHoldUseCase } from '../application/confirm-escrow-hold.use-case';
 import { PlaceEscrowHoldUseCase } from '../application/place-escrow-hold.use-case';
@@ -18,8 +19,19 @@ import {
 
 const INTENT_ID = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
 
+/** Test principal + tenant — exercises the principal threading. */
+const TEST_TENANT = rehydrateTenantId('a1b2c3d4-1111-4222-8333-444444444444');
+const TEST_PRINCIPAL: Principal = {
+  kind: 'app',
+  appId: 'app-uuid-test',
+  tenantId: TEST_TENANT,
+  scopes: ['escrows:write', 'escrows:release'],
+  expiresAt: new Date('2030-01-01T00:00:00Z'),
+};
+
 function heldEscrow(): Escrow {
   const escrow = Escrow.create({
+    tenantId: TEST_TENANT,
     paymentIntentId: INTENT_ID,
     heldAmount: Money.of(10_000, 'NGN'),
     provider: 'paystack',
@@ -63,6 +75,7 @@ describe('PostgresEscrowRepository (integration)', () => {
       const appender = new LedgerAppender(new PostgresLedgerRepository(pool));
       const unitOfWork = new UnitOfWork(pool);
       const place = new PlaceEscrowHoldUseCase({
+        principal: TEST_PRINCIPAL,
         idempotency: new PostgresIdempotencyStore(pool),
         escrows: repo(),
         ledger: appender,
