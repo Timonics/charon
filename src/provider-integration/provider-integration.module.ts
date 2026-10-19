@@ -43,7 +43,6 @@ import { PAYMENT_GATEWAYS } from '../payments/payment.constants';
   imports: [UnitOfWorkModule],
   providers: [
     FetchHttpClient,
-    { provide: 'HTTP_CLIENT', useExisting: FetchHttpClient },
     PostgresWebhookInboxStore,
     PaystackWebhookAdapter,
     {
@@ -95,7 +94,7 @@ import { PAYMENT_GATEWAYS } from '../payments/payment.constants';
         }
         return map;
       },
-      inject: ['HTTP_CLIENT'],
+      inject: [FetchHttpClient],
     },
   ],
   exports: [
