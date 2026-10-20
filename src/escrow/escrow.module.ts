@@ -12,6 +12,7 @@
 import { Module } from '@nestjs/common';
 
 import { LedgerModule } from '../ledger/ledger.module';
+import { type SqlExecutor } from '../shared/infrastructure/db';
 import { UnitOfWorkModule } from '../shared/infrastructure/unit-of-work.module';
 import { CancelEscrowUseCase } from './application/cancel-escrow.use-case';
 import { ConfirmEscrowHoldUseCase } from './application/confirm-escrow-hold.use-case';
@@ -25,7 +26,11 @@ import { PostgresEscrowRepository } from './infrastructure/postgres-escrow.repos
 @Module({
   imports: [LedgerModule, UnitOfWorkModule],
   providers: [
-    PostgresEscrowRepository,
+    {
+      provide: PostgresEscrowRepository,
+      useFactory: (db: SqlExecutor) => new PostgresEscrowRepository(db),
+      inject: ['SQL_EXECUTOR'],
+    },
     PlaceEscrowHoldUseCase,
     ConfirmEscrowHoldUseCase,
     ReleaseEscrowUseCase,

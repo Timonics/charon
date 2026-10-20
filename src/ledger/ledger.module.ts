@@ -12,13 +12,21 @@
  */
 import { Module } from '@nestjs/common';
 
+import { type SqlExecutor } from '../shared/infrastructure/db';
 import { UnitOfWorkModule } from '../shared/infrastructure/unit-of-work.module';
 import { LedgerAppender } from './application/ledger-appender';
 import { PostgresLedgerRepository } from './infrastructure/postgres-ledger.repository';
 
 @Module({
   imports: [UnitOfWorkModule],
-  providers: [LedgerAppender, PostgresLedgerRepository],
+  providers: [
+    LedgerAppender,
+    {
+      provide: PostgresLedgerRepository,
+      useFactory: (db: SqlExecutor) => new PostgresLedgerRepository(db),
+      inject: ['SQL_EXECUTOR'],
+    },
+  ],
   exports: [LedgerAppender, PostgresLedgerRepository],
 })
 export class LedgerModule {}

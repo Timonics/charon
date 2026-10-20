@@ -34,8 +34,8 @@
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
+import { json } from 'express';
 import { AppModule } from './app.module';
-import { RawBodyMiddleware } from './interface/http/middleware/raw-body.middleware';
 
 async function bootstrap(): Promise<void> {
   const logger = new Logger('Bootstrap');
@@ -43,10 +43,24 @@ async function bootstrap(): Promise<void> {
     bufferLogs: true,
   });
 
-  // Raw-body capture for webhook signature verification. Must run
-  // BEFORE the Nest bodyParser so the bytes are collected in their
-  // pre-parse form.
-  app.use(new RawBodyMiddleware().use);
+  // Body parser + raw-body capture via bodyParser.json's `verify`
+  // callback. The callback fires before the JSON is parsed, so
+  // `req.rawBody` holds the exact byte stream needed for webhook
+  // HMAC signature verification.
+  app.use(
+    json({
+      limit: '1mb',
+      verify: (req, _res, buf) => {
+        // Only populate rawBody for non-empty bodies. GET/DELETE
+        // requests never reach here, but be defensive: a
+        // method-mismatch POST with no body shouldn't try to
+        // attach an undefined buffer.
+        if (buf && buf.length > 0) {
+          (req as unknown as { rawBody?: Buffer }).rawBody = buf;
+        }
+      },
+    }),
+  );
 
   // ValidationPipe on the inbound DTO surface. Strips unknown
   // fields, rejects extra fields with `forbidNonWhitelisted`,

@@ -31,6 +31,7 @@ import {
   FetchHttpClient,
   type HttpClient,
 } from '../shared/infrastructure/http-client';
+import { type SqlExecutor } from '../shared/infrastructure/db';
 import { UnitOfWorkModule } from '../shared/infrastructure/unit-of-work.module';
 import { MissingGatewayAdapterError } from './application/errors';
 import type { PaymentGatewayPort } from './application/ports/payment-gateway.port';
@@ -43,8 +44,32 @@ import { PAYMENT_GATEWAYS } from '../payments/payment.constants';
   imports: [UnitOfWorkModule],
   providers: [
     FetchHttpClient,
-    PostgresWebhookInboxStore,
-    PaystackWebhookAdapter,
+    {
+      // The PostgresWebhookInboxStore depends on a structural
+      // SqlExecutor (not a class). Use a factory so the
+      // SQL_EXECUTOR token from UnitOfWorkModule satisfies the
+      // dependency.
+      provide: PostgresWebhookInboxStore,
+      useFactory: (db: SqlExecutor) => new PostgresWebhookInboxStore(db),
+      inject: ['SQL_EXECUTOR'],
+    },
+    {
+      // The Paystack webhook adapter needs the same secret
+      // key as the gateway adapter (it's used to verify the
+      // x-paystack-signature HMAC). A missing key throws
+      // MissingGatewayAdapterError at boot, same as the
+      // gateway side, so an unset env fails loud.
+      provide: PaystackWebhookAdapter,
+      useFactory: (): PaystackWebhookAdapter => {
+        const key = process.env.CHRON_PAYSTACK_SECRET_KEY;
+        if (!key) {
+          throw new MissingGatewayAdapterError(
+            'paystack webhook: CHRON_PAYSTACK_SECRET_KEY is not set',
+          );
+        }
+        return new PaystackWebhookAdapter(key);
+      },
+    },
     {
       // The payment gateway map. Built from the
       // `CHRON_PAYMENT_ENABLED_PROVIDERS` env var (default
